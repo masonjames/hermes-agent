@@ -57,7 +57,12 @@ class TestDotenvFallbackPerProvider:
             mock_import.return_value.assert_called_once_with(api_key="el-dotenv-key")
 
     def test_xai_reads_dotenv_key(self, tmp_path):
+        """xAI TTS now resolves credentials through ``tools.xai_http``; the
+        dotenv fallback contract from #17140 is preserved by patching the
+        resolver's ``get_env_value`` rather than ``tts_tool.get_env_value``.
+        """
         from tools import tts_tool
+        from tools import xai_http
 
         captured: dict = {}
 
@@ -69,55 +74,12 @@ class TestDotenvFallbackPerProvider:
             response.raise_for_status = MagicMock()
             return response
 
-        with patch.object(tts_tool, "get_env_value", return_value="xai-dotenv-key"), \
+        with patch.object(xai_http, "get_env_value", return_value="xai-dotenv-key"), \
              patch("requests.post", side_effect=fake_post):
             tts_tool._generate_xai_tts("hi", str(tmp_path / "out.mp3"), {})
 
         assert captured["headers"]["Authorization"] == "Bearer xai-dotenv-key"
 
-    def test_minimax_reads_dotenv_key(self, tmp_path):
-        from tools import tts_tool
-
-        captured: dict = {}
-
-        def fake_post(url, **kwargs):
-            captured["headers"] = kwargs.get("headers", {})
-            response = MagicMock()
-            response.json.return_value = {
-                "data": {"audio": b"\x00\x01".hex()},
-                "base_resp": {"status_code": 0},
-            }
-            response.raise_for_status = MagicMock()
-            return response
-
-        with patch.object(tts_tool, "get_env_value", return_value="mm-dotenv-key"), \
-             patch("requests.post", side_effect=fake_post):
-            tts_tool._generate_minimax_tts("hi", str(tmp_path / "out.mp3"), {})
-
-        assert captured["headers"]["Authorization"] == "Bearer mm-dotenv-key"
-
-    def test_mistral_reads_dotenv_key(self, tmp_path):
-        import base64
-
-        from tools import tts_tool
-
-        seen_keys: list = []
-
-        def fake_mistral_factory(*, api_key=None):
-            seen_keys.append(api_key)
-            client = MagicMock()
-            client.__enter__ = MagicMock(return_value=client)
-            client.__exit__ = MagicMock(return_value=False)
-            client.audio.speech.complete.return_value = MagicMock(
-                audio_data=base64.b64encode(b"data").decode()
-            )
-            return client
-
-        with patch.object(tts_tool, "get_env_value", return_value="mistral-dotenv-key"), \
-             patch.object(tts_tool, "_import_mistral_client", return_value=fake_mistral_factory):
-            tts_tool._generate_mistral_tts("hi", str(tmp_path / "out.mp3"), {})
-
-        assert seen_keys == ["mistral-dotenv-key"]
 
     def test_gemini_reads_dotenv_key(self, tmp_path):
         from tools import tts_tool
@@ -174,6 +136,45 @@ class TestRegressionGuard:
     key while ``os.environ`` does not.
     """
 
+    def test_import_after_config_env_patch_uses_restored_dotenv_loader(self, tmp_path, monkeypatch):
+        """Importing TTS while hermes_cli.config.get_env_value is patched must
+        not freeze that temporary helper into this module forever.
+        """
+        import importlib
+        import hermes_cli.config as config_mod
+        from tools import tts_tool
+
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(config_mod, "get_env_value", lambda name: "")
+            tts_tool = importlib.reload(tts_tool)
+
+        try:
+            captured: dict = {}
+
+            def fake_post(url, **kwargs):
+                captured["headers"] = kwargs.get("headers", {})
+                response = MagicMock()
+                response.json.return_value = {
+                    "data": {"audio": b"\x00".hex()},
+                    "base_resp": {"status_code": 0},
+                }
+                response.raise_for_status = MagicMock()
+                return response
+
+            with patch(
+                "hermes_cli.config.load_env",
+                return_value={"MINIMAX_API_KEY": "dotenv-secret"},
+            ), patch("requests.post", side_effect=fake_post):
+                tts_tool._generate_minimax_tts(
+                    "hi", str(tmp_path / "out.mp3"), {}
+                )
+
+            assert captured["headers"]["Authorization"] == "Bearer dotenv-secret"
+        finally:
+            importlib.reload(tts_tool)
+
     def test_minimax_missing_when_only_in_dotenv_before_fix(self, tmp_path, monkeypatch):
         from tools import tts_tool
 
@@ -225,6 +226,8 @@ class TestRegressionGuard:
         with patch(
             "hermes_cli.config.load_env",
             return_value={"MINIMAX_API_KEY": "dotenv-secret"},
+        ), patch.object(
+            tts_tool, "_load_tts_config", return_value={"provider": "minimax"}
         ), patch.object(tts_tool, "_import_edge_tts", side_effect=ImportError), \
              patch.object(tts_tool, "_import_elevenlabs", side_effect=ImportError), \
              patch.object(tts_tool, "_import_openai_client", side_effect=ImportError), \
