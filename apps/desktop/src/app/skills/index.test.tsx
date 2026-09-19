@@ -1,12 +1,17 @@
 // @vitest-environment jsdom
 import { QueryClientProvider } from '@tanstack/react-query'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type * as ReactRouterDom from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
 import { queryClient } from '@/lib/query-client'
+import type * as HubActions from '@/store/hub-actions'
+
+import { parseCatalog } from './catalog-data'
+import { SkillCatalog } from './skill-catalog'
+import { $catalogCardView } from './store'
 
 const getSkills = vi.fn()
 const getToolsets = vi.fn()
@@ -42,6 +47,14 @@ vi.mock('@/store/notifications', () => ({
   notifyError: vi.fn()
 }))
 
+// The catalog Install button routes through the hub action pipeline — stub the
+// action entrypoint (real module kept: SkillsView reads $hubActions and the
+// query keys from it).
+vi.mock('@/store/hub-actions', async importOriginal => ({
+  ...(await importOriginal<typeof HubActions>()),
+  installHubSkill: vi.fn().mockResolvedValue(undefined)
+}))
+
 // The vision detail navigates to Settings → Models via useNavigate; spy on it
 // so the deep-link target is assertable.
 const navigateSpy = vi.fn()
@@ -50,6 +63,11 @@ vi.mock('react-router', async importOriginal => ({
   ...(await importOriginal<typeof ReactRouterDom>()),
   useNavigate: () => navigateSpy
 }))
+
+// Import at module scope (after the hoisted vi.mock calls) so the heavy
+// component-tree transform is paid during collection, not billed against the
+// first test's testTimeout — same flake class as messaging/index.test.tsx.
+const { SkillsView } = await import('./index')
 
 function toolset(overrides: Record<string, unknown> = {}) {
   return {
@@ -65,7 +83,6 @@ function toolset(overrides: Record<string, unknown> = {}) {
 }
 
 async function renderSkills() {
-  const { SkillsView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
@@ -82,6 +99,8 @@ async function renderSkills() {
 }
 
 beforeEach(() => {
+  // Scope/install cases exercise the retained list layout; cards have dedicated coverage.
+  $catalogCardView.set(false)
   getSkills.mockResolvedValue([])
   getToolsets.mockResolvedValue([toolset()])
   setToolsetEnabled.mockResolvedValue({ ok: true, name: 'web', enabled: false })
@@ -100,11 +119,17 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  vi.unstubAllGlobals()
   // Shared singleton client — drop cached skills/toolsets so each test refetches.
   queryClient.clear()
 })
 
-describe('SkillsView toolset management', () => {
+// SkillsView is a heavy module (import cost now paid at module scope above,
+// during collection) but the file still legitimately runs ~14s on CI runners —
+// right against the global 15s per-test budget, so slow runners cascade-fail
+// all 11 tests (2× in a row on PR #93612, plus a main run the same hour).
+// Give this file headroom; the tests are not slow individually.
+describe('SkillsView toolset management', { timeout: 60_000 }, () => {
   it('renders a switch for each toolset and toggles it off', async () => {
     await renderSkills()
 
@@ -156,7 +181,6 @@ describe('SkillsView toolset management', () => {
       ]
     })
 
-    const { SkillsView } = await import('./index')
     await act(async () => {
       render(
         <QueryClientProvider client={queryClient}>
@@ -202,7 +226,6 @@ describe('SkillsView toolset management', () => {
       }
     ])
 
-    const { SkillsView } = await import('./index')
     await act(async () => {
       render(
         <QueryClientProvider client={queryClient}>
@@ -246,7 +269,6 @@ describe('SkillsView toolset management', () => {
       }
     ])
 
-    const { SkillsView } = await import('./index')
     await act(async () => {
       render(
         <QueryClientProvider client={queryClient}>
@@ -266,30 +288,190 @@ describe('SkillsView toolset management', () => {
     expect(await screen.findByText(/Deep research steps/)).toBeTruthy()
   })
 
-  it('hub picker refuses to reinstall an already-installed skill', async () => {
-    const { notify } = await import('@/store/notifications')
-    const { EmbeddedHubPicker } = await import('./embedded-hub-picker')
+  it.each(['web-research', 'official/research/web-research'])(
+    'disables catalog installation when the installed list contains %s',
+    async installedName => {
+      const { installHubSkill } = await import('@/store/hub-actions')
+      queryClient.setQueryData(['public-catalog', 'skills'], parseCatalog('skills', [{
+        name: 'web-research',
+        identifier: 'official/research/web-research',
+        source: 'official',
+        category: 'research',
+        description: 'Research the web'
+      }]))
 
-    render(<EmbeddedHubPicker installedNames={new Set(['web-research'])} profile={null} />)
+      render(
+        <QueryClientProvider client={queryClient}>
+          <SkillCatalog installedNames={new Set([installedName])} profile="researcher" />
+        </QueryClientProvider>
+      )
 
-    // The picker is expanded by default — the hub iframe is live on mount.
-    expect(document.querySelector('iframe')).toBeTruthy()
+      fireEvent.click(screen.getByRole('button', { name: /^web-research/ }))
+      const installed = screen.getByRole('button', { name: 'Installed' })
+      expect((installed as HTMLButtonElement).disabled).toBe(true)
+      fireEvent.click(installed)
+      expect(installHubSkill).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([
+    {
+      source: 'github',
+      identifier: 'github:example/skills/research/community-research',
+      expectedIdentifier: 'github:example/skills/research/community-research'
+    },
+    {
+      source: 'clawhub',
+      identifier: 'community-research',
+      expectedIdentifier: 'clawhub/community-research'
+    },
+    {
+      source: 'clawhub',
+      identifier: 'clawhub/community-research',
+      expectedIdentifier: 'clawhub/community-research'
+    }
+  ])('installs $identifier with its source-qualified target in the pinned connection and profile', async ({ source, identifier, expectedIdentifier }) => {
+    const { installHubSkill } = await import('@/store/hub-actions')
+    const entry = {
+      name: 'community-research',
+      identifier,
+      source,
+      category: 'research',
+      description: 'Community research workflow'
+    }
+    queryClient.setQueryData(['public-catalog', 'skills'], parseCatalog('skills', [
+      { ...entry, name: 'other-skill', source: 'github', identifier: 'github:example/skills/other-skill' },
+      entry
+    ]))
 
     await act(async () => {
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          data: { type: 'hermes-skill-pick', name: 'web-research', identifier: 'web-research' },
-          origin: 'https://hermes-agent.nousresearch.com'
-        })
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={['/skills']}>
+            <SkillsView embedded fixedConnection="homelab" fixedProfile="researcher" />
+          </MemoryRouter>
+        </QueryClientProvider>
       )
     })
 
-    // Refused with an informational toast, no install action spawned.
-    await waitFor(() =>
-      expect(vi.mocked(notify)).toHaveBeenCalledWith(
-        expect.objectContaining({ title: '"web-research" is already installed' })
-      )
+    fireEvent.click(screen.getByRole('button', { name: 'Browse' }))
+    fireEvent.click(await screen.findByRole('button', { name: /^community-research/ }))
+    expect(screen.getByRole('heading', { name: entry.name })).toBeTruthy()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Install' }))
+    })
+
+    expect(installHubSkill).toHaveBeenCalledExactlyOnceWith(expectedIdentifier, {
+      connectionId: 'homelab', profile: 'researcher'
+    })
+  })
+
+  it('keeps a pending install tied to its entry and scope when the pinned target changes', async () => {
+    const { installHubSkill } = await import('@/store/hub-actions')
+    const identifier = 'clawhub/community-research'
+    queryClient.setQueryData(['public-catalog', 'skills'], parseCatalog('skills', [
+      { name: 'community-research', identifier: 'community-research', source: 'clawhub' },
+      { name: 'other-skill', identifier: 'official/research/other-skill', source: 'optional' }
+    ]))
+    let finishFirst!: () => void
+    let finishSecond!: () => void
+    const firstInstall = new Promise<void>(resolve => { finishFirst = resolve })
+    const secondInstall = new Promise<void>(resolve => { finishSecond = resolve })
+    vi.mocked(installHubSkill)
+      .mockReturnValueOnce(firstInstall)
+      .mockReturnValueOnce(secondInstall)
+
+    const scopedView = (connectionId: string, profile: string) => (
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/skills']}>
+          <SkillsView embedded fixedConnection={connectionId} fixedProfile={profile} />
+        </MemoryRouter>
+      </QueryClientProvider>
     )
+    const view = render(scopedView('homelab', 'researcher'))
+    fireEvent.click(screen.getByRole('button', { name: 'Browse' }))
+    fireEvent.click(await screen.findByRole('button', { name: /^community-research/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Install' }))
+    const pending = screen.getByRole<HTMLButtonElement>('button', { name: 'Installing...' })
+    expect(pending.disabled).toBe(true)
+    expect(pending.querySelector('svg.animate-spin')).not.toBeNull()
+    fireEvent.click(pending)
+    expect(installHubSkill).toHaveBeenCalledExactlyOnceWith(identifier, {
+      connectionId: 'homelab', profile: 'researcher'
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /^other-skill/ }))
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Install' }).disabled).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: /^community-research/ }))
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Installing...' }).disabled).toBe(true)
+
+    view.rerender(scopedView('other-gateway', 'writer'))
+    fireEvent.click(await screen.findByRole('button', { name: /^community-research/ }))
+    const nextInstall = screen.getByRole<HTMLButtonElement>('button', { name: 'Install' })
+    expect(nextInstall.disabled).toBe(false)
+    fireEvent.click(nextInstall)
+    expect(installHubSkill).toHaveBeenNthCalledWith(2, identifier, {
+      connectionId: 'other-gateway', profile: 'writer'
+    })
+
+    await act(async () => {
+      finishFirst()
+      await firstInstall
+    })
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Installing...' }).disabled).toBe(true)
+    await act(async () => {
+      finishSecond()
+      await secondInstall
+    })
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Install' }).disabled).toBe(false)
+    expect(installHubSkill).toHaveBeenCalledTimes(2)
+  })
+
+  it('loads the public catalog only on Browse and reuses it across skills and tools tab switches', async () => {
+    const fetchCatalog = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [{
+        name: 'catalog-research',
+        identifier: 'official/research/catalog-research',
+        source: 'official',
+        category: 'research',
+        description: 'Research from the public snapshot'
+      }]
+    })
+    vi.stubGlobal('fetch', fetchCatalog)
+
+    await renderSkills() // ?tab=toolsets
+    await screen.findByRole('switch', { name: 'Turn Web Search toolset off' })
+    expect(fetchCatalog).not.toHaveBeenCalled()
+    cleanup()
+
+    await act(async () => {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={['/skills']}>
+            <SkillsView embedded />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+    })
+
+    expect(screen.queryByRole('heading', { name: 'catalog-research' })).toBeNull()
+    expect(fetchCatalog).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Browse' }))
+    expect(await screen.findByRole('heading', { name: 'catalog-research' })).toBeTruthy()
+    expect(fetchCatalog).toHaveBeenCalledTimes(1)
+    expect(fetchCatalog.mock.calls[0][0]).toMatch(/\/docs\/api\/skills\.json$/)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Installed' }))
+    expect(screen.queryByRole('heading', { name: 'catalog-research' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Browse' }))
+    expect(await screen.findByRole('heading', { name: 'catalog-research' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /^Tools/ }))
+    await screen.findByRole('switch', { name: 'Turn Web Search toolset off' })
+    expect(screen.queryByRole('heading', { name: 'catalog-research' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /^Skills/ }))
+    expect(await screen.findByRole('heading', { name: 'catalog-research' })).toBeTruthy()
+    expect(fetchCatalog).toHaveBeenCalledTimes(1)
   })
 
   it('shows a vision explainer that deep-links to Settings → Models', async () => {
@@ -318,5 +500,140 @@ describe('SkillsView toolset management', () => {
     // Internal route change into the Models section with the aux slot target —
     // consumed by ModelSettings' deep-link highlight. Never an external URL.
     await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith('/settings?tab=config:model&aux=vision'))
+  })
+
+  it('fixedConnection pins every read to the target connection', async () => {
+    // Bot Mode's remote-target door: a bot on another registered gateway gets
+    // the live surface pointed at ITS backend — the reads must carry the
+    // (connection, profile) pin, not a bare profile name that would resolve
+    // against the ACTIVE gateway (the wrong-machine bug).
+    await act(async () => {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={['/skills']}>
+            <SkillsView embedded fixedConnection="homelab" fixedProfile="inbox-bot" />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+    })
+
+    await waitFor(() => expect(getSkills).toHaveBeenCalled())
+    expect(getSkills.mock.calls[0][0]).toEqual({ connectionId: 'homelab', profile: 'inbox-bot' })
+    expect(getToolsets.mock.calls[0][0]).toEqual({ connectionId: 'homelab', profile: 'inbox-bot' })
+    // Pinned scope → no roster/profiles fetch, selector hidden.
+    expect(getProfiles).not.toHaveBeenCalled()
+  })
+
+  it('offers (connection, profile) scope rows on multi-connection desktops', async () => {
+    // With a v2 registry holding >1 connection, the scope selector lists the
+    // union agent roster — profile + owning device — instead of the local
+    // profiles list, so a selection identifies WHICH gateway's capabilities
+    // are being configured.
+    const connections = {
+      list: vi.fn().mockResolvedValue({
+        version: 2,
+        primary: 'local',
+        secureTokenStorage: true,
+        connections: [
+          { id: 'local', kind: 'local', label: 'This device', tokenSet: false, tokenPreview: null },
+          { id: 'homelab', kind: 'remote', label: 'Homelab', tokenSet: true, tokenPreview: '…' }
+        ]
+      })
+    }
+
+    const getAgentRoster = vi.fn().mockResolvedValue({
+      agents: [
+        {
+          connectionId: 'local',
+          connectionKind: 'local',
+          connectionLabel: 'This device',
+          profile: 'default',
+          handle: 'default'
+        },
+        {
+          connectionId: 'homelab',
+          connectionKind: 'remote',
+          connectionLabel: 'Homelab',
+          profile: 'inbox-bot',
+          handle: 'inbox-bot-homelab'
+        }
+      ],
+      sources: []
+    })
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = { connections, getAgentRoster }
+
+    try {
+      await renderSkills()
+
+      await waitFor(() => expect(getAgentRoster).toHaveBeenCalled())
+      // The selector paints roster rows labeled profile — device.
+      expect(await screen.findByText('default — This device (current)')).toBeTruthy()
+    } finally {
+      delete (window as { hermesDesktop?: unknown }).hermesDesktop
+    }
+  })
+
+  it('offers optional skills through Browse and guards installed skills using the scoped installed list', async () => {
+    const { installHubSkill } = await import('@/store/hub-actions')
+    getSkills.mockResolvedValue([
+      {
+        name: 'web-research',
+        description: 'Research the web',
+        category: 'research',
+        enabled: true,
+        usage: 3,
+        provenance: 'bundled'
+      }
+    ])
+    queryClient.setQueryData(['public-catalog', 'skills'], parseCatalog('skills', [
+      {
+        name: 'gif-search',
+        description: 'Search GIFs',
+        source: 'optional',
+        installIdentifier: 'official/gifs/gif-search',
+        category: 'gifs',
+        tags: ['gifs']
+      },
+      {
+        name: 'web-research',
+        description: 'Research the web',
+        source: 'optional',
+        identifier: 'official/research/web-research',
+        category: 'research'
+      }
+    ]))
+
+    await act(async () => {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={['/skills?tab=skills']}>
+            <SkillsView fixedProfile="researcher" />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+    })
+
+    expect(await screen.findByRole('switch', { name: 'web-research' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^gif-search/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Install' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Browse' }))
+    fireEvent.click(await screen.findByRole('button', { name: /^web-research/ }))
+
+    // Browse keeps installed entries discoverable, but never reinstallable.
+    const detail = within(screen.getByRole('main'))
+    const installed = detail.getByRole<HTMLButtonElement>('button', { name: 'Installed' })
+    expect(installed.disabled).toBe(true)
+    fireEvent.click(installed)
+    expect(installHubSkill).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: /^gif-search/ }))
+    expect(detail.getByRole('heading', { name: 'gif-search' })).toBeTruthy()
+    expect(screen.queryByRole('switch')).toBeNull()
+
+    await act(async () => {
+      fireEvent.click(detail.getByRole('button', { name: 'Install' }))
+    })
+
+    expect(installHubSkill).toHaveBeenCalledExactlyOnceWith('official/gifs/gif-search', 'researcher')
   })
 })
